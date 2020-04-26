@@ -247,16 +247,14 @@ def calc_fundamental(feat_path='',feat_file='features.pkl'):
 	#merge on exact date
 	to_merge = ['be','td','td_d','sales','prof','prof2','cf','cf2','rdq','datadate']
 	crsp = crsp.merge(comp[['gvkey','jdate']+cols_out+to_merge],how='left',on=['gvkey','jdate'])
-	#create a copy of signals forward filled for at most 12 months
-	cols_asof = [x+'_asof' for x in cols_out]
-	crsp[cols_asof+to_merge] = crsp.groupby('permno')[cols_out+to_merge].fillna(method='ffill',limit=12)
-	cols = cols_out + cols_asof
+	#forward fill up to 3 months
+	crsp[to_merge] = crsp.groupby('permno')[to_merge].fillna(method='ffill',limit=3)
 	#calculate enterprise value, value signals, leverage on me/ev
 	crsp['ev'] = crsp['me_lag']+crsp['td'].fillna(0)
 	ratio_vars2 = ['td_d','be','sales','prof','prof2','cf','cf2']
 	crsp[[var+'_me' for var in ratio_vars2]] = crsp[ratio_vars2].divide(crsp['me_lag'],0)
 	crsp[[var+'_ev' for var in ratio_vars2]] = crsp[ratio_vars2].divide(crsp['ev'],0)
-	cols += [var+'_me' for var in ratio_vars2]+[var+'_ev' for var in ratio_vars2]
+	cols = cols_out + [var+'_me' for var in ratio_vars2]+[var+'_ev' for var in ratio_vars2]
 	crsp = crsp.rename(columns={'rdq':'last_filing_date','datadate':'last_filing_period'})
 	cols += ['last_filing_date','last_filing_period']
 	output_features(crsp,cols,feat_path=feat_path,feat_file=feat_file)
