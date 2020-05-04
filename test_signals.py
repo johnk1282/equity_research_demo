@@ -34,7 +34,7 @@ class Backtester(object):
 		self.df_feat = get_features(overwrite=overwrite_features,feat_path=feat_path,feat_file=feat_file)
 		if model_name!='':
 			print('initializing from output model '+model_name)
-			self.df_sig,self.df_ret,self.model_spec = import_model(model_name)
+			self.df_sig,self.df_ret,self.df_macro,self.model_spec,self.macro_model_spec = import_model(model_name)
 		else:
 			self.df_univ = get_universe(n_stocks=univ_size,start_date=univ_start_date,univ_name=univ_name+'.pkl')
 			if len(signal_specs)>0:
@@ -48,15 +48,43 @@ class Backtester(object):
 				raise ValueError('must provide name of already output model, list of signal specifications, or list of features for model')
 			print('creating signal dataframe')
 			self.df_sig,self.df_ret = create_signal_df(self.df_univ,self.df_feat,self.model_spec)
+			self.df_macro = pd.DataFrame(index=self.df_ret.index)
+			self.macro_model_spec = {}
+
+	def create_macro_factors(self,macro_model_spec):
+		self.df_macro = pd.DataFrame(index=self.df_ret.index)
+		self.macro_model_spec = macro_model_spec
+		for macro_factor in macro_model_spec['macro_factors']:
+			self.append_macro_factor(macro_factor['name'],macro_factor['series'],macro_factor['series_type'],**macro_factor['kwargs'])
+		for sig in macro_model_spec['signal_specs']:
+			self.df_ret[sig['signal_name']]=self.df_ret[sig['base_signal']]*self.df_macro[sig['macro_factors']].mean(1)
+			self.df_sig[sig['signal_name']]=self.df_sig[sig['base_signal']]*self.df_macro[sig['macro_factors']].mean(1).reindex(self.df_sig.index.get_level_values(1)).values
+
+	def append_macro_factor(self,macro_factor_name,series_name,series_type='signal_return',**kwargs):
+		if series_type=='signal_return':
+			series = self.df_ret[series_name]
+		elif series_type=='value_spread':
+			temp = self.df_sig.merge(self.df_feat.reset_index()[['be_me','permno','date']],how='left',on=['permno','date'])
+			temp['vs'] = temp['be_me']*temp[series_name]
+			series = temp.groupby('date')['vs'].sum()
+		elif series_type=='macro':
+			try:
+				series = get_macro_df()[series_name]
+			except:
+				raise ValueError("can't locate "+signal+" in external macro df")
+		else:
+			raise ValueError('unrecognized series_type')
+		series = create_macro_factor(series,**kwargs)
+		self.df_macro[macro_factor_name] = series
 
 	def output_model(self,model_name):
-		if not os.path.isfile('models/'+model_name+'_model_spec.txt'):
-			with open('models/'+model_name+'_model_spec.txt', 'w') as outfile:
-				json.dump(self.model_spec, outfile)
-			self.df_sig.to_pickle('models/'+model_name+'_signal_df.pkl')
-			self.df_ret.to_pickle('models/'+model_name+'_ret_df.pkl')
-		else:
-			print('already output model with name '+model_name)
+		with open('models/'+model_name+'_model_spec.txt', 'w') as outfile:
+			json.dump(self.model_spec, outfile)
+		with open('models/'+model_name+'_macro_factor_specs.txt', 'w') as outfile:
+			json.dump(self.macro_model_spec, outfile)
+		self.df_sig.to_pickle('models/'+model_name+'_signal_df.pkl')
+		self.df_ret.to_pickle('models/'+model_name+'_ret_df.pkl')
+		self.df_macro.to_pickle('models/'+model_name+'_macro_df.pkl')
 	
 	def backtest_signals(self,signals,
 					start_date=None,
@@ -67,10 +95,12 @@ class Backtester(object):
 					model_analysis=False,
 					average_signal_analysis=False,
 					interaction_analysis=False,
-					time_series_analysis=False,
 					trading_cost_analysis=False,
+					time_series_analysis=False,
+					factor_timing_analysis=False,
 					quantiles=10,
 					signal_to_interact=None,
+					macro_factors=None,
 					model_name='ff'):
 
 		if (start_date==None)&(end_date==None):
@@ -98,17 +128,28 @@ class Backtester(object):
 			plot_average_signal(temp,signals,model_name)
 		if interaction_analysis:
 			plot_interaction(temp,signals,signal_to_interact,model_name)
-		if time_series_analysis:
-			plot_time_series(temp,temp_ret,self.df_feat,signals)
 		if trading_cost_analysis:
 			plot_trading_cost(temp,temp_ret,signals,model_name)
+		if time_series_analysis:
+			try:
+				df_feat = self.df_feat
+			except:
+				df_feat = get_features()
+			plot_time_series(temp,temp_ret,df_feat,signals)
+		if factor_timing_analysis:
+			if type(macro_factors)!=list:
+				macro_factors = [macro_factors]
+			plot_factor_timing(temp_ret,self.df_macro,signals,macro_factors)
 
 def import_model(model_name):
 	df_sig = pd.read_pickle('models/'+model_name+'_signal_df.pkl')
 	df_ret = pd.read_pickle('models/'+model_name+'_ret_df.pkl')
+	df_macro = pd.read_pickle('models/'+model_name+'_macro_df.pkl')
 	with open('models/'+model_name+'_model_spec.txt', 'r') as infile:
 		model_spec = json.loads(infile.read())
-	return df_sig,df_ret,model_spec
+	with open('models/'+model_name+'_macro_factor_specs.txt', 'r') as infile:
+		macro_model_spec = json.loads(infile.read())
+	return df_sig,df_ret,df_macro,model_spec,macro_model_spec
 
 def create_signal_df(df_univ,df_feat,model):
 	temp = df_univ.copy()
@@ -146,7 +187,7 @@ def create_signal_df(df_univ,df_feat,model):
 		temp[feat_list] = temp.groupby('date')[feat_list].apply(normalize_signal_ranks)
 	#compute weighted averages of features
 	for i,sig in enumerate(sig_list):
-		temp[sig] = temp[feat_nlist[i]].multiply(w_nlist[i]).mean(1)
+		temp[sig] = temp[feat_nlist[i]].multiply(w_nlist[i]).sum(1)/pd.notnull(temp[feat_nlist[i]]).multiply(w_nlist[i]).abs().sum(1)
 	#adjust within industries
 	if industry_adjust:
 		sig_ia = [sig_list[i] for i,x in enumerate(ia_list) if x==True]
@@ -499,6 +540,7 @@ def plot_time_series(df_sig,df_ret,df_feat,signals):
 	rec = get_recession_dates()
 	rec = rec.loc[(rec.index<=max_date)&(rec.index>=min_date)]
 
+	df_sig = df_sig.merge(df_feat.reset_index()[['be_me','permno','date']],how='left',on=['permno','date'])
 	for f in signals:
 		fig = plt.figure(figsize=(12,22))
 		gs = fig.add_gridspec(5,2)
@@ -510,8 +552,6 @@ def plot_time_series(df_sig,df_ret,df_feat,signals):
 		ax5 = fig.add_subplot(gs[2,1])
 		ax6 = fig.add_subplot(gs[3,0])
 		ax7 = fig.add_subplot(gs[3,1])
-		ax8 = fig.add_subplot(gs[4,0])
-		ax9 = fig.add_subplot(gs[4,1])
 		
 		plot_acf(df_ret[f].values,ax=ax0,title=f+': Autocorrelation Function')
 		plot_pacf(df_ret[f].values,ax=ax1,title=f+': Partial-Autocorrelation Function')
@@ -538,55 +578,68 @@ def plot_time_series(df_sig,df_ret,df_feat,signals):
 		means.index = ['Low','High']
 		means.plot(ax=ax5,kind='bar',color=colors[0],edgecolor='k',title='Return Conditional on Fitted Vol')
 		
-		df_sig = df_sig.merge(df_feat.reset_index()[['be_me','permno','date']],how='left',on=['permno','date'])
-		df_sig['posw'] = df_sig[f]>0
-		ts = df_sig.groupby(['date','posw'])['be_me'].median().unstack()
-		out['vs'] = (ts[True]-ts[False])
-		#out['vs'] = ((out['vs']-out['vs'].mean())/out['vs'].std()).shift(1)
-		out['vs'] = out['vs'].expanding(min_periods=36).apply(lambda x: (x.iloc[-1]-x.mean())/x.std()).shift(1)
-		#out['vs'] = out['vs'].rolling(120,min_periods=36).apply(lambda x: (x.iloc[-1]-x.mean())/x.std()).shift(1)
-		out['vs'].plot(title='Value Spread Z-Score (Long-Short Median BE/ME)',color=colors[1],ax=ax6)
-		ax6.axhline(1,color='k',linestyle='--')
-		ax6.axhline(-1,color='k',linestyle='--')
-		out['vs_bucket'] = (out['vs']>1)*1+(out['vs']>0)*1
+		df_sig['factor_be_me'] = df_sig[f]*df_sig['be_me']
+		ts = df_sig.groupby(['date'])['factor_be_me'].sum()
+		ts = ts.apply(lambda x: (ts<x).mean())
+		ts.plot(title='Signal Value Spread Percentile',color=colors[1],ax=ax6)
+		ax6.axhline(.5,color='k',linestyle='--')
+		out['vs_bucket'] = (ts>.5)*1
 		means = out.groupby('vs_bucket')['returns'].mean()*12
-		means.index = ['Low','Med','High']
+		means.index = ['Low','High']
 		means.plot(ax=ax7,kind='bar',color=colors[0],edgecolor='k',title='Return Conditional on Value Spread')
 
-		ff = get_ff_model()
-		ar = arch_model(ff['Mkt-RF']*100, mean='AR', lags=1, vol='garch', p=1, o=0, q=1,dist='Normal')
-		res = ar.fit(disp='off')
-		out['Mkt-RF'] = ff['Mkt-RF'].rolling(12).mean().shift(-6)
-		out['Mkt-RF instantaneous vol'] = np.sqrt(ff['Mkt-RF']**2)
-		out['Mkt-RF conditional vol'] = res.conditional_volatility/100
-		out[['Mkt-RF instantaneous vol','Mkt-RF conditional vol']].plot(ax=ax8,title='GARCH(1,1) Mkt-RF Fitted Values',color=colors)
-		ax8.axhline(out['Mkt-RF conditional vol'].mean(),color='k',linestyle='--')
-		#out['high_vol'] = out['Mkt-RF conditional vol']>out['Mkt-RF conditional vol'].mean()
-		out['high_vol'] = out['Mkt-RF']>out['Mkt-RF'].mean()
-		means = out.groupby('high_vol')['returns'].mean()
-		means.index = ['Low','High']
-		means.plot(ax=ax9,kind='bar',color=colors[0],edgecolor='k',title='Return Conditional on Mkt-RF Fitted Vol')
-		
 		ax2.set_xlabel('')
 		ax3.set_xlabel('')
 		ax4.set_xlabel('')
 		ax5.set_xlabel('')
 		ax6.set_xlabel('')
 		ax7.set_xlabel('')
-		ax8.set_xlabel('')
-		ax9.set_xlabel('')
 		ax3.set_xticklabels(ax3.get_xticklabels(),rotation=0)
 		ax5.set_xticklabels(ax5.get_xticklabels(),rotation=0)
 		ax7.set_xticklabels(ax7.get_xticklabels(),rotation=0)
-		ax9.set_xticklabels(ax9.get_xticklabels(),rotation=0)
 		ylim = ax2.get_ylim()
 		ax2.fill_between(out.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
 		ylim = ax4.get_ylim()
 		ax4.fill_between(out.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
 		ylim = ax6.get_ylim()
 		ax6.fill_between(out.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
-		ylim = ax8.get_ylim()
-		ax8.fill_between(out.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
+		plt.show()
+
+def plot_factor_timing(df_ret,df_macro,signals,macro_factors):
+	temp = pd.concat([df_macro[macro_factors],df_ret[signals]],1).dropna()
+	min_date = temp.index.min().strftime('%Y-%m')
+	max_date = temp.index.max().strftime('%Y-%m')
+	rec = get_recession_dates()
+	rec = rec.loc[(rec.index<=max_date)&(rec.index>=min_date)]
+
+	for f in signals:
+		fig = plt.figure(figsize=(12,15))
+		gs = fig.add_gridspec(3,1)
+		ax0 = fig.add_subplot(gs[0,0])
+		ax1 = fig.add_subplot(gs[1,0])
+		ax2 = fig.add_subplot(gs[2,0])
+		
+
+		temp[macro_factors].mean(1).plot(ax=ax0,color=colors[1],title='Macro factor (leverage): '+'/'.join(macro_factors))
+		ax0.set_xlabel('')
+		ylim = ax0.get_ylim()
+		ax0.fill_between(temp.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
+		
+		temp[f+'_timed'] = temp[f]*temp[macro_factors].mean(1)
+		temp['average'] = temp[[f,f+'_timed']].mean(1)
+		(1+temp[[f,f+'_timed','average']]).cumprod().plot(ax=ax1,color=colors,title='Signal vs. timed signal',logy=True)
+		ax1.set_xlabel('')
+		ylim = ax1.get_ylim()
+		ax1.fill_between(temp.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
+		
+		temp['const'] = 1
+		mod = sm.OLS(temp[f+'_timed'],temp[[f,'const']]).fit()
+		temp['alpha'] = temp[f+'_timed']-temp[f]*mod.params[0]
+		(1+temp['alpha']).cumprod().plot(ax=ax2,color=colors[1],title='Timing alpha vs. constant signal',logy=True)
+		ax2.annotate('t-stat: '+str(round(mod.tvalues[1],2)),(temp.index.values[-1],(1+temp['alpha']).cumprod().values[-1]))
+		ax2.set_xlabel('')
+		ylim = ax2.get_ylim()
+		ax2.fill_between(temp.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
 		plt.show()
 
 def plot_trading_cost(df_sig,df_ret,signals,model_name='ff'):
@@ -596,13 +649,14 @@ def plot_trading_cost(df_sig,df_ret,signals,model_name='ff'):
 	rec = rec.loc[(rec.index<=max_date)&(rec.index>=min_date)]
 	signals = list(signals)
 
+	rets = df_ret[signals].copy()
+	
 	df_sig[[x+'_prev' for x in signals]] = df_sig.groupby('permno')[signals].shift(1).fillna(0)
 	df_sig[[x+'_turn' for x in signals]] = (df_sig[signals]-df_sig[[x+'_prev' for x in signals]].values).abs()
 	df_sig[[x+'_trade_cost' for x in signals]] = df_sig[[x+'_turn' for x in signals]].multiply(df_sig['bidask_lag'],0)/2
 	turn = df_sig.groupby('date')[[x+'_turn' for x in signals]].sum()/2
 	trade_cost = df_sig.groupby('date')[[x+'_trade_cost' for x in signals]].sum()
-	df_ret[[x+'_net' for x in signals]] = df_ret[signals]-trade_cost.values
-
+	rets[[x+'_net' for x in signals]] = rets[signals]-trade_cost.values
 	fig = plt.figure(figsize=(12,20))
 	gs = fig.add_gridspec(4,3)
 	ax0 = fig.add_subplot(gs[0,:])
@@ -636,8 +690,10 @@ def plot_trading_cost(df_sig,df_ret,signals,model_name='ff'):
 	ax[1].set_xlabel('')
 	ylim = ax[1].get_ylim()
 	ax[1].fill_between(trade_cost.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
+	ax[0].legend(signals)
+	ax[1].legend(signals)
 
-	cr = (1+df_ret).cumprod()
+	cr = (1+rets).cumprod()
 	if len(signals)==1:
 		cr[signals].plot(logy=True,ax=ax[2],color=colors[1],title='Long-short portfolios')
 		cr[[x+'_net' for x in signals]].plot(logy=True,ax=ax[2],color=colors[1],linestyle='--',title='Long-short portfolios')
@@ -648,26 +704,25 @@ def plot_trading_cost(df_sig,df_ret,signals,model_name='ff'):
 	ylim = ax[2].get_ylim()
 	ax[2].fill_between(cr.index.values, ylim[0], ylim[1], rec.values[:,0], facecolor='k', alpha=0.1)
 
-	df_ret = df_ret[signals+[x+'_net' for x in signals]].copy()
 	stats=pd.DataFrame()
-	stats['Mean'] = df_ret.mean()*12
-	stats['Vol'] = df_ret.std()*np.sqrt(12)
-	stats['Sharpe']=df_ret.mean()/df_ret.std()*np.sqrt(12)
+	stats['Mean'] = rets.mean()*12
+	stats['Vol'] = rets.std()*np.sqrt(12)
+	stats['Sharpe']=rets.mean()/rets.std()*np.sqrt(12)
 	if model_name=='ff':
 		ff = get_ff_model()
 		model_vars = ['Mkt-RF','HML','SMB','UMD']
-		df_ret[model_vars] = ff[model_vars]
+		rets[model_vars] = ff[model_vars]
 	else:
 		model_rets = pd.read_pickle('models/'+model_name+'_ret_df.pkl')
 		ff = get_ff_model()
-		df_ret['Mkt-RF'] = ff['Mkt-RF']
+		rets['Mkt-RF'] = ff['Mkt-RF']
 		model_vars = list(model_rets.columns)
-		df_ret[model_vars] = model_rets[model_vars]
-	df_ret['Const.'] = 1
+		rets[model_vars] = model_rets[model_vars]
+	rets['Const.'] = 1
 	params = pd.DataFrame(index=model_vars+['Const.'])
 	tvalues = pd.DataFrame(index=model_vars+['Const.'])
 	for f in signals+[x+'_net' for x in signals]:
-		res = sm.OLS(df_ret[f],df_ret[model_vars+['Const.']]).fit()
+		res = sm.OLS(rets[f],rets[model_vars+['Const.']]).fit()
 		params[f]=res.params
 		tvalues[f]=res.tvalues
 

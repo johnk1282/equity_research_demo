@@ -1,7 +1,10 @@
 import multiprocessing as mp
 import pandas as pd
+from pandas.tseries.offsets import *
+import numpy as np
 import os
-import pandas_datareader as pdr
+from statsmodels.tsa.arima_model import ARIMA
+from arch import arch_model
 
 def multi_groupby(df,groupby_cols,func):
     #helper function to do a pandas groupby().apply() using multi-processing
@@ -14,23 +17,66 @@ def multi_groupby(df,groupby_cols,func):
 def normalize_signal_ranks(x):
 	return 2*(x.rank()-x.rank().mean())/(x.rank()-x.rank().mean()).abs().sum()
 
-def get_ff_model():
-	if os.path.isfile('models/ff_ret.pkl'):
-		ff = pd.read_pickle('models/ff_ret.pkl')
+def create_macro_factor(series,normalizing_func=None,winsorize_cutoff=None,scale=1,shift=0,rolling_window=120,min_periods=120,order=(1,0,1)):
+	if normalizing_func==None:
+		pass
+	elif normalizing_func=='expanding_arima':
+		series = expanding_arima(series,order=order,min_periods=min_periods)['pred_z']
+	elif normalizing_func=='expanding_garch':
+		series = expanding_garch(series,order=order,min_periods=min_periods)['vol_z']
+	elif normalizing_func=='expanding_z':
+		series = series.expanding(min_periods=min_periods).apply(lambda x: (x.iloc[-1]-x.mean())/x.std())
+	elif normalizing_func=='rolling_z':
+		series = series.rolling(rolling_window,min_periods=min_periods).apply(lambda x: (x.iloc[-1]-x.mean())/x.std())
+	elif normalizing_func=='expanding_ptile':
+		series = 2*series.expanding(min_periods=min_periods).apply(lambda x: (x.dropna()<x.iloc[-1]).mean())-1
+	elif normalizing_func=='rolling_ptile':
+		series = 2*series.rolling(rolling_window,min_periods=min_periods).apply(lambda x: (x.dropna()<x.iloc[-1]).mean())-1
 	else:
-		ff = pdr.famafrench.FamaFrenchReader('F-F_Research_Data_Factors',start='1960-01-01').read()[0]/100
-		ff['UMD'] = pdr.famafrench.FamaFrenchReader('F-F_Momentum_Factor',start='1960-01-01').read()[0].iloc[:,0]/100
-		ff.index = pd.to_datetime(ff.index.astype(str),format='%Y-%m')
-		ff.to_pickle('models/ff_ret.pkl')
-	return ff
+		raise ValueError('normalizing_func not recognized')
+	series = series.dropna()
+	if winsorize_cutoff!=None:
+		series = scale*series.where(series.abs()<winsorize_cutoff,winsorize_cutoff*np.sign(series))+shift
+	else:
+		series = scale*series+shift
+	return series
 
-def get_recession_dates():
-	if os.path.isfile('recession_dates.pkl'):
-		rec = pd.read_pickle('recession_dates.pkl')
-	else:
-		rec = pdr.fred.FredReader('USREC', start='1950-01-01', end='2020-01-01').read()
-		rec.to_pickle('recession_dates.pkl')
-	return rec
+def expanding_arima(data,order=(1,0,1),start_date='1980-01-01',min_periods=120):
+    temp = data.dropna()
+    d = pd.to_datetime(start_date)
+    end_date = temp.index[-1]
+    out = pd.DataFrame(columns=['pred','pred_z'],index=temp.index)
+    while d<=end_date:
+        temp2 = temp.loc[temp.index<d]
+        if len(temp2)<min_periods:
+            d+=DateOffset(months=1)
+            continue
+        mod = ARIMA(temp2,order=order,freq='MS')
+        res = mod.fit()
+        pred = res.predict(d)[0]
+        out.loc[d]=[pred,(pred-res.fittedvalues.mean())/res.fittedvalues.std()]
+        d+=DateOffset(months=1)
+    return out.astype(float)
+
+def expanding_garch(data,order=(1,0,1),start_date='1980-01-01',min_periods=120):
+    temp = data.dropna()
+    d = pd.to_datetime(start_date)
+    end_date = data.index[-1]
+    out = pd.DataFrame(columns=['vol','vol_z'],index=data.index)
+    while d<=end_date:
+        temp2 = temp.loc[temp.index<d]       
+        if len(temp2)<min_periods:
+            d+=DateOffset(months=1)
+            continue
+        mod = arch_model(100*temp2,mean='AR',lags=1,vol='garch',p=order[0],o=order[1],q=order[2],dist='Normal')
+        res = mod.fit(disp='off')
+        std = res.conditional_volatility.std()
+        mean = res.conditional_volatility.mean()
+        forecasts = res.forecast(horizon=1)
+        vol = np.sqrt(forecasts.variance['h.1'].values[-1])
+        out.loc[d]=[vol,(vol-mean)/std]
+        d+=DateOffset(months=1)
+    return out.astype(float)
 
 def get_industry_sic_map():
 	#map from SIC codes to Fama-French industries (from Kenneth French's data website)

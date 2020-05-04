@@ -131,22 +131,25 @@ def ar1(data):
 		out.append(forecast[0][0])
 	return out
 
-
 class SecurityRanker(Backtester):
-	def __init__(self,model_name,ranking_name=''):
+	def __init__(self,model_name,model=[],ranking_name=''):
 		self.model_name = model_name
 		if ranking_name!='':
 			print('importing previously saved ranking '+ranking_name+' on model '+model_name)
 			try:
 				self.df_weight_all,self.df_sig,self.df_ret,self.ranking_specs = import_rankings(model_name,ranking_name)
-				self.model = self.df_ret.columns[:(len(self.df_ret.columns)-len(self.ranking_specs))]
+				cols = self.df_weight_all.columns[:int((len(self.df_weight_all.columns)/len(self.ranking_specs)))]
+				self.model = [x.split()[-1] for x in cols]
 			except:
 				raise ValueError('make sure '+ranking_name+' is output')
 		else:
 			Backtester.__init__(self,model_name=model_name)
 			self.df_weight_all = pd.DataFrame(index=self.df_ret.index)
 			self.ranking_specs = {}		
-			self.model = self.df_ret.columns
+			if len(model)==0:
+				self.model = self.df_ret.columns
+			else:
+				self.model = model
 		self.end_date = self.df_ret.index[-1]
 		self.df_weight = pd.DataFrame(index=self.df_ret.index,columns=self.model)
 
@@ -187,9 +190,24 @@ class SecurityRanker(Backtester):
 		self.df_weight = pd.DataFrame(index=self.df_ret.index,columns=self.model)
 		self.ranking_specs[name] = {'method':method,'start_date':start_date,'reestimate_freq':reestimate_freq,**kwargs}
 
-	def rank_constant(self,name,w=[]):
-		if len(w)==0:
-			w = [1/len(self.model)]*len(self.model)
+	def rank_constant(self,name,method='constant_weight',w=[],start_date=None,**kwargs):
+		if start_date==None:
+			start_date = self.end_date+MonthBegin(1)
+		if method == 'riskparity':
+			df_train = self.df_ret.loc[self.df_ret.index<start_date][self.model]
+			w = get_riskparity_weights(df_train,self.model,**kwargs)
+		elif method == 'parametricopt':
+			df_train = self.df_sig.reset_index()
+			df_train = df_train.loc[df_train['date']<start_date]
+			w = get_parametricopt_weights(df_train,self.model,**kwargs)
+		elif method == 'markowitz':
+			df_train = self.df_ret.loc[self.df_ret.index<start_date][self.model]
+			w = get_markowitz_weights(df_train,self.model,**kwargs)
+		elif method == 'constant_weight':
+			if len(w)==0:
+				w = [1/len(self.model)]*len(self.model)
+		else:
+			raise ValueError('unknown method '+method)
 		self.df_weight.loc[self.df_weight.index[0]] = w
 		self.df_weight = self.df_weight.fillna(method='ffill')
 		reshaped = self.df_weight.loc[self.df_sig.index.get_level_values(1)]
@@ -201,7 +219,7 @@ class SecurityRanker(Backtester):
 		self.df_weight.columns = [name+' '+x for x in self.df_weight.columns]
 		self.df_weight_all = pd.concat([self.df_weight_all,self.df_weight],1)
 		self.df_weight = pd.DataFrame(index=self.df_ret.index,columns=self.model)
-		self.ranking_specs[name] = {'method':'const','const_weights':w}
+		self.ranking_specs[name] = {'method':'const','const_weights':w,'start_date':self.df_weight_all.index[0]}
 
 	def output_rankings(self,ranking_name):
 		if not os.path.isfile('rankings/'+self.model_name+'_'+ranking_name+'_runs.txt'):
@@ -323,14 +341,76 @@ class PortfolioConstructor(SecurityRanker):
 		else:
 			print('already output portfolios '+self.model_name+'_'+self.ranking_name+'_'+portfolio_name)
 	
-	def analyze_portfolios(self,portfolios=[]):
+	def plot_security_selection(self,portfolio_name,ranking_name='overall_ranking',start_date=None,end_date=None):
+		if (start_date==None)&(end_date==None):
+			start_date=pd.DataFrame(self.portfolio_specs).T['start_date'].min()
+			end_date=pd.Timestamp.today()
+		elif (start_date==None):
+			start_date=pd.DataFrame(self.portfolio_specs).T['start_date'].min()
+		elif (end_date==None):
+			end_date=pd.Timestamp.today()
+		temp_sig = self.df_sig.loc[(self.df_sig.index.get_level_values(1)>=start_date)&(self.df_sig.index.get_level_values(1)<=end_date)].reset_index()
+		temp_sig[ranking_name+' rank'] = temp_sig.groupby('date')[ranking_name].rank(method='first',ascending=False).astype(int)
+		cmap = sns.diverging_palette(240, 10, as_cmap=True)
+		fig,ax=plt.subplots(1,1,figsize=(12,5))
+		hm = temp_sig.pivot(index=ranking_name+' rank',columns='date',values=portfolio_name).fillna(0)
+		sns.heatmap(hm,cmap=cmap,ax=ax,cbar=True)
+		d0 = hm.columns[0]
+		d1 = hm.columns[-1]
+		try:
+			txt = 'portfolio_name: '+portfolio_name+'; n_securities: '+str(self.portfolio_specs[portfolio_name]['n_securities'])+'; turnover_penalty: '+str(self.portfolio_specs[portfolio_name]['turn_penalty'])
+		except:
+			txt = 'portfolio_name: '+portfolio_name
+		ax.set_title('Security weight in long-short portfolio, ranked by '+ranking_name+'\n'+txt)
+		ax.set_xlabel('')
+		ax.set_xticklabels('')
+		y = ax.get_ylim()
+		x = ax.get_xlim()
+		ax.annotate(d0.strftime('%Y-%m'),(x[0],y[0]),xytext=(0,-15), textcoords='offset points',ha='left',va='bottom')
+		ax.annotate(d1.strftime('%Y-%m'),(x[1],y[0]),xytext=(0,-15), textcoords='offset points',ha='right',va='bottom')
+		plt.show()
+
+	def analyze_portfolios(self,portfolios=[],start_date=None,end_date=None):
 		if type(portfolios)!=list:
 			portfolios = ['overall_ranking',portfolios]
 		if len(portfolios)==0:
-			portfolios = ['overall_ranking']+list(self.portfolio_specs.keys())
-		start_date = pd.DataFrame(self.portfolio_specs).T['start_date'].min()
-		temp_sig = self.df_sig.loc[self.df_sig.index.get_level_values(1)>=start_date].reset_index()
-		temp_ret = self.df_ret.loc[self.df_ret.index>=start_date]
+			portfolios = list(self.portfolio_specs.keys())
+		if (start_date==None)&(end_date==None):
+			start_date=pd.DataFrame(self.portfolio_specs).T['start_date'].min()
+			end_date=pd.Timestamp.today()
+		elif (start_date==None):
+			start_date=pd.DataFrame(self.portfolio_specs).T['start_date'].min()
+		elif (end_date==None):
+			end_date=pd.Timestamp.today()
+
+		temp_sig = self.df_sig.loc[(self.df_sig.index.get_level_values(1)>=start_date)&(self.df_sig.index.get_level_values(1)<=end_date)].reset_index()
+		temp_ret = self.df_ret.loc[(self.df_ret.index>=start_date)&(self.df_ret.index<=end_date)]
+		
+		temp_sig['overall_ranking rank'] = temp_sig.groupby('date')['overall_ranking'].rank(method='first',ascending=False).astype(int)
+		cmap = sns.diverging_palette(240, 10, as_cmap=True)
+		fig,ax=plt.subplots(len(portfolios),1,figsize=(12,3*len(portfolios)),sharex=True)
+		for i,port in enumerate(portfolios):
+			hm = temp_sig.pivot(index='overall_ranking rank',columns='date',values=port).fillna(0)
+			try:
+				txt = 'portfolio_name: '+port+'; n_securities: '+str(self.portfolio_specs[port]['n_securities'])+'; turnover_penalty: '+str(self.portfolio_specs[port]['turn_penalty'])
+			except:
+				txt = 'portfolio_name: '+port
+			if i==0:
+				sns.heatmap(hm,cmap=cmap,ax=ax[i],cbar=True)
+				d0 = hm.columns[0]
+				d1 = hm.columns[-1]
+				ax[i].set_title('Security weight in long-short portfolio, ranked by overall_ranking\n'+txt)
+			else:
+				sns.heatmap(hm,cmap=cmap,ax=ax[i],cbar=True)
+				ax[i].set_title(txt)
+			ax[i].set_xlabel('')
+			ax[i].set_xticklabels('')
+			y = ax[i].get_ylim()
+			x = ax[i].get_xlim()
+			#ax[i].annotate(txt,((x[1]-x[0])/2,(y[0]-y[1])/2),ha='center',va='center')
+			ax[i].annotate(d0.strftime('%Y-%m'),(x[0],y[0]),xytext=(0,-15), textcoords='offset points',ha='left',va='bottom')
+			ax[i].annotate(d1.strftime('%Y-%m'),(x[1],y[0]),xytext=(0,-15), textcoords='offset points',ha='right',va='bottom')
+		plt.show()
 		plot_trading_cost(temp_sig,temp_ret,portfolios,model_name='ff')
 
 def import_portfolios(model_name,ranking_name,portfolio_name):

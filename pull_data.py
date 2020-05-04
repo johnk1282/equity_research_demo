@@ -1,8 +1,10 @@
 import os
 import pandas as pd
 from pandas.tseries.offsets import *
+import pandas_datareader as pdr
 import numpy as np
 import wrds
+from utils import expanding_garch
 
 #----------------------------------------------------------
 # functions to retrieve input data from WRDS (login needed) 
@@ -230,6 +232,53 @@ def get_inst_hold(input_path='input/'):
 		inst_hold.to_pickle(input_path+'tr/13f_agg.pkl')
 		db.close()
 	return inst_hold
+
+def get_ff_model(input_path='input/'):
+	if os.path.isfile(input_path+'ff_ret.pkl'):
+		ff = pd.read_pickle(input_path+'ff_ret.pkl')
+	else:
+		ff = pdr.famafrench.FamaFrenchReader('F-F_Research_Data_Factors',start='1960-01-01').read()[0]/100
+		ff['UMD'] = pdr.famafrench.FamaFrenchReader('F-F_Momentum_Factor',start='1960-01-01').read()[0].iloc[:,0]/100
+		ff.index = pd.to_datetime(ff.index.astype(str),format='%Y-%m')
+		ff.to_pickle(input_path+'ff_ret.pkl')
+	return ff
+
+def get_recession_dates(input_path='input/'):
+	if os.path.isfile(input_path+'recession_dates.pkl'):
+		rec = pd.read_pickle(input_path+'recession_dates.pkl')
+	else:
+		rec = pdr.fred.FredReader('USREC', start='1950-01-01', end='2020-01-01').read()
+		rec.to_pickle(input_path+'recession_dates.pkl')
+	return rec
+
+def get_macro_df(input_path='input/'):
+	if os.path.isfile(input_path+'macro.pkl'):
+		df = pd.read_pickle(input_path+'macro.pkl')
+	else: 
+		df = pdr.fred.FredReader(['BAA','AAA'], start='1950-01-01', end='2020-01-01').read()
+		df.index=pd.to_datetime(df.index)
+		df['BAA-AAA'] = df['BAA']-df['AAA']
+		df['BAA-AAA_pct'] = df['BAA-AAA'].pct_change()
+		df2 = pdr.fred.FredReader(['DGS10','DGS2'], start='1950-01-01', end='2020-01-01').read()
+		df2.index=pd.to_datetime(df2.index)
+		df2['UST10-UST2'] = df2['DGS10']-df2['DGS2']
+		df2['date'] = pd.to_datetime(df2.index.strftime('%Y-%m-01'))
+		df[['UST10','UST2','UST10-UST2']] = df2.groupby('date')[['DGS10','DGS2','UST10-UST2']].last()
+		ind = get_indices_d()
+		ind['date'] = pd.to_datetime(ind['date'])
+		ind = ind.sort_values(by='date')
+		ind['MktVol'] = ind['sprtrn'].rolling(22).std()
+		ind['date'] = pd.to_datetime(ind['date'].dt.strftime('%Y-%m-01'))
+		df['MktVol'] = ind.groupby('date')['MktVol'].last()
+		ind = get_indices_m()
+		ind.index = pd.to_datetime(ind['date'])-MonthBegin(1)
+		df['sprtrn'] = ind['sprtrn']
+		out = expanding_garch(df['sprtrn'],order=(1,0,1),start_date='1950-01-01')
+		df[['GarchVol','GarchVol_z']] = out[['vol','vol_z']].astype(float)
+		df[['BAA-AAA_lag','UST10-UST2_lag','MktVol_lag']] = df[['BAA-AAA','UST10-UST2','MktVol']].shift(1)
+		df[['BAA-AAA_lag_z','UST10-UST2_lag_z','MktVol_lag_z']] = df[['BAA-AAA_lag','UST10-UST2_lag','MktVol_lag']].expanding().apply(lambda x: (x.iloc[-1]-x.mean())/x.std())
+		df.to_pickle(input_path+'macro.pkl')
+	return df
 
 if __name__ == '__main__':
 	crsp_m = get_crsp_m()
